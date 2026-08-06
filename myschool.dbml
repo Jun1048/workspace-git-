@@ -1,6 +1,0 @@
-Table students {
-    id int [pk, increment, note: "학번"]
-    name VARCHAR(50) [NOT NULL, note: "학생 이름"]
-    user_id VARCHAR(50) [NOT NULL, note: "사용자명"]
-    note: '학생'
-}
