@@ -1,5 +1,7 @@
 import numpy as np
+
 from pandas import DataFrame, Series, Grouper, concat, to_datetime
+from . import my_plot
 
 
 # 정상성 검정·자기상관 계수 계산
@@ -256,3 +258,466 @@ def adf_test(data, column=None, name=None, alpha=0.05):
         "정상성": stationary,
         "판정": "정상" if stationary else "비정상",
     }], index = [name])
+
+
+
+
+
+# --------------------------
+# 시계열 데이터 변환 함수 정의
+# --------------------------
+def transform(data, column=None, log=False, diff=0, seasonal_diff=0, period=None):
+
+    """ 로그변환 · 일반차분 · 계절차분을 순서대로 적용한다.  
+
+    
+    Args:
+        data (DataFrame | Series): 변환할 시계열 데이터.
+        column (str): data가 데이터프레임인 경우 대상 컬럼명 (기본값: None).
+        log (bool): 로그변환 적용 여부 (기본값: False).
+        diff (int): 일반차분 횟수. ARIMA의 d에 해당 (기본값: 0).
+        seasonal_diff (int): 계절차분 횟수. ARIMA의 D에 해당 (기본값: 0).
+        period (int): 계절 주기. seasonal_dioff가 1 이상이면 반드시 지정 (기본값: None).
+
+    
+    Returns:
+        Series: 변환이 완료된 시계열. 차분으로 생긴 결측치는 제거된다.
+
+    """
+
+
+
+    # --- 0) 대상 컬럼 추출 ---
+    if column is not None:
+        data = data[column]
+
+    result = data.copy()
+
+
+
+    # --- 1) 로그변환 : 분산이 커지는 문제를 잡는다 ---
+    if log:
+        result = np.log(result)
+
+
+
+    # --- 2) 일반차분 : 추세를 없앤다 ---
+    for i in range(diff):
+        result = result.diff()
+
+
+
+    # --- 3) 계절차분 : 주기적 반복을 없앤다 ---
+    for i in range(seasonal_diff):
+        result = result.diff(period)
+
+    return result.dropna()
+
+
+
+
+
+# -------------------------------------
+# 차분 회차별 ADF 검정 자동 수행 함수 정의
+# -------------------------------------
+def adf_diff(data, column=None, max_diff=-1, alpha=0.05):
+
+
+    """ 차분 차수를 늘려가며 ADF 검정을 수행하고 과대차분 여부를 판정한다.
+
+    표준편차가 최소가 되는 차수를 넘기면 데이터에 없던 노이즈를 만들어낸다.
+    p-value를 낮추는 것이 목적이 아니라 필요한 만큼만 차분하는 것이 목적이다.
+
+
+    Args:
+        data (DataFrame) | Series): 검정할 시계열 데이터.
+        column (str): data가 데이터프레임인 경우 대상 컬럼명 (기본값: None).
+        max_diff (int): 최대 차분 횟수. -1이면 표준편차가 다시 커지는 지점,
+                        즉, 과대차분이 시작되는 곳에서 스스로 멈춘다. (기본값: -1)
+        alpha (float): 유의수준 (기본값: 0.05)
+
+    
+    Returns:
+        DataFrame: 차수별 ADF 검정 결과와 권장 표시.
+
+    """
+
+
+    # --- 0) 대상 컬럼 추출 ---
+    if column is not None:                  # 컬럼명이 있다면
+        data = data[column]                 # 대상 데이터만 추출
+
+    result = []                             # 결과를 담을 리스트
+    target = data.copy()                    # 검정할 대상 시계열. 차분할 때마다 관측치가 하나씩 줄어든다.
+
+    order = 0                               # 지금까지 차분하 횟수
+    previous_std = None                     # 직전 차수의 표준편차
+    stopped = None                          # 과대차분이 검출된 차수 이름
+
+
+
+    # --- 1) 0차(원본)부터 차수를 늘려가며 검정 ---
+    while True:
+
+
+        # --- 1-1) ADF 검정 ---
+        name = "원본" if order == 0 else f"{order}차 차분"      # 차분 회차별 이름 구성
+        row = adf_test(target, name=name, alpha=alpha)         # 검정 수행
+        result.append(row)                                     # 검정 결과를 리스트에 추가
+        current_std = row["표준편차"].iloc[0]                   # 검정 결과에서 표준편차만 가져오기
+
+        # --- 1-2) 멈출 때가 되었는지 확인 ---
+        if max_diff < 0:                                       # 최대 차분 횟수를 지정하지 않았다면
+
+            # --- 표준편차가 직전보다 커졌다면 이미 한 번 지나친 것이므로 여기서 멈춘다
+            if previous_std is not None and current_std > previous_std:
+                stopped = name                                 # --- 과대 차분이 시작된 차수 이름 기록
+                break                                          # --- 반복을 멈춘다
+
+        elif order >= max_diff:                                # 최대 차분 횟수를 지정했고 그 횟수에 도달했다면
+            break                                              # --- 반복을 멈춘다
+
+
+        # --- 1-3) 다음 차수 준비 (반복을 멈춘 경우 아래 코드는 실행 안됨) ---
+        previous_std = current_std                             # 직전 차수의 표준편차를 현재 차수의 표준편차로 갱신
+        order = order + 1                                      # 차분 횟수 1 증가
+
+
+        # 다음 차수를 위해 1차 차분 수행. 차분할 때마다 관측치가 하나씩 줄어든다.
+        target = target.diff().dropna()
+
+
+        # 관측치가 너무 적어지면 검정 자체가 의미를 잃으므로 멈춘다
+        if len(target) < 10:
+            break
+
+
+    result_df = concat(result)                                 # 결과 리스트를 데이터프레임으로 합치기
+
+
+
+    # --- 2) 표준편차가 최소인 차수 확인 --> 과대 차분 시작 직전 지점 ---
+    best = result_df["표준편차"].idxmin()                       # 표준편차가 최소인 차수 이름
+    best_at = list(result_df.index).index(best)                 # 그 차수가 몇 번째 행인지
+    recommend = []                                              # 권장 표시를 담을 리스트
+
+    for position, name in enumerate(result_df.index):           # 각 행을 순서대로 순회하며
+        if position == best_at:                                 # 표준편차가 최소인 차수라면
+            recommend.append("★ 여기까지")                      # 여기서 멈추라는 표시
+
+        elif position > best_at:                                # 최소점을 지난 차수라면
+            recommend.append("과대차분")                         # 차분이 지나쳤다는 표시
+
+        else:
+            recommend.append("")                                # 빈 문자열을 넣는다
+
+
+    result__df["권장"] = recommend                               # 권장 표시를 결과표에 추가
+
+
+
+    # --- 3) 판단 근거를 글로 알린다 ---
+    if stopped is not None:                                      # 자동으로 멈춘 경우라면
+        print(f"{stopped}에서 표준편차가 다시 커져 중단했습니다. (과대차분 시작)")
+
+    print(f"권장 차분 차수: {best} (표준편차가 최소인 지점)")
+
+
+    # 권장 차수가 아직 비정상이면 차분을 더 하는 것이 답이 아님을 알린다.
+    # 남은 원인은 대개 계절성고 분산이며, 그것은 차분 횟수로 풀 문제가 아니다.
+    if not result_df.loc[best, "정상성"]:
+        pvalue = result_df.iloc[best, "p-value"]
+        print(f"※ {best}은 아직 비정상입니다(p-value {pvalue}). 차분을 더 늘리지 말고"
+              f"로그변환·계절차분으로 남은 구조를 처리하세요. → adf_transform()")
+
+
+    return result_df                                              # 결과표 반환
+
+
+
+
+
+# --------------------------
+# 자동 전처리 + 검정 함수 정의
+# --------------------------
+def adf_transform(data, column=None, period=None, max_diff=2, log=True, alpha=0.05):
+
+    """ 로그변환 · 일반차분 · 계절차분의 조합을 만들어 전부 ADF 검정한다.
+
+    정상성을 만족하는 조합 중 표준편차가 가장 작은 것이 맨 위에 온다.
+
+
+    Args:
+        data (DataFrame | Series): 검정할 시계열 데이터.
+        column (str): data가 데이터프레임인 경우 대상 컬럼명 (기본값: None)
+        period (int): 계절 주기. None이면 계절차분 조합을 만들지 않음 (기본값: None)
+        max_dff (int): 조합에 포함할 최대 일반차분 횟수 (기본값: 2)
+        log (bool): 로그변환 조합을 포함할지 여부 (기본값: True)
+        alpha (float): 유의수준 (기본값: 0.05)
+    
+        
+    Returns:
+        DataFrame: 조합별 ADF 검정 결과표. 정상성과 표준편차 순으로 정렬된다.
+
+    """
+
+
+
+    # --- 1) 조합 후보 정의 ---
+    if column is not None:                              # 컬럼명이 있다면
+        data = data[column]                             # 대상 데이터만 추출
+
+    log_options = [False]                               # 로그변환 여부 후보. False만 넣어두고 True를 추가할지 결정
+
+
+    if log:                                             # 사용자가 로그변환 조합을 포함하라고 했다면
+        log_options.append(True)                        # True를 후보에 추가
+
+    seasonal_options = [0]                             # 주기를 모르면 계절차분은 시도하지 않는다
+
+
+    if period is not None:                              # 주기를 지정했다면
+        seasonal_options.append(1)                     # 계절차분 1회 조합을 후보에 추가
+
+
+    result = []                                         # 결과를 담을 리스트
+
+
+
+    # --- 2) 모든 조합을 순회하며 변환 후 검정 ---
+    for use_log in log_options:                         # 로그변환 여부 후보 순회
+        for diff in range(max_diff + 1):                # 일반차분 횟수 후보 순회
+            for seasonal_diff in seasonal_options:      # 계절차분 여부 후보 순회
+
+
+                # --- 2-1) 조합 이름 구성 ---
+                parts = []
+                if use_log:                             # 로그변환을 적용했다면 조합이름에 추가
+                    parts.append("로그변환")
+
+                if diff > 0:                            # 일반차분을 적용했다면 조합이름에 추가
+                    parts.append(f"{diff}차 차분")
+
+                if seasonal_diff > 0:                   # 계절차분을 적용했다면 조합이름에 추가
+                    parts.append(f"계절차분({period})")
+
+                if len(parts) == 0:                     # 조합이름이 비어있다며 원본임
+                    name = "원본"
+
+                else:
+                    name = " + ".join(parts)
+
+ 
+                
+                # --- 2-2) 조합대로 변환 후 ADF 검정 ---
+                target = data.copy()                    # 조합대로 변환을 수행하기 위해 원본 복사
+
+                if use_log:                             # 로그변환을 적용했다면 처리한다.
+                    target = np.log(target)
+
+                for i in range(diff):                   # 일반차분을 적용했다면 처리한다.
+                    target = target.diff()
+
+                for i in range(seasonal_diff):          # 계절차분을 적용했다면 처리한다.
+                    target = target.diff(period)
+
+
+                # 결측치 제거 후 ADF 검정
+                result.append(adf_test(target.dropna(), name=name, alpha=alpha))
+    
+
+    # --- 3) 정상성 우선, 같으면 표준편차가 작은 순으로 정렬 ---
+    result_df = concat(result)
+    result_df = result_df.sort_values(["정상성", "표준편차"], ascending=[False, True])
+
+    best = result_df.index[0]
+    best_std = result_df["표준편차"].iloc[0]
+
+    print(f"조합 {len(result_df)}개 중 정상 {int(result_df['정상성'].sum())}개")
+    print(f"권장 전처리: {best}")
+
+
+
+    # --- 4) 과대차분 경고 ---
+    # 권장한 조합보다 표준편차가 더 작은데 정상성만 못 갖춘 조합이 있다면,
+    # 차분을 한 번 더 해서 정상성을 얻는 대신 없던 노이즈를 만들었을 수 있다.
+    smaller = result_df[result_df["표준편차"] < best_std]
+
+    if len(smaller) > 0:
+        name = smaller["표준편차"].idxmin()
+        std = smaller["표준편차"].min()
+        print(f"※ {name}의 표준편차({std})가 더 작습니다. "
+              f"과대차분일 수 있으니 계절차분·로그변환을 함께 검토하세요.")
+
+    display(result_df)                  # 결과표 출력
+
+
+    return changed[best]                # 최적의 전처리 결과 반환
+
+
+
+
+
+# -----------------------------------------------
+# 원본 + 이동평균 + 이동표준편차 시각화 함수 정의
+# -----------------------------------------------
+def plot_rolling(data, window, column=None, title=None, xlabel=None, ylabel=None,
+                 width=1280, height=480, save_path=None):
+
+    """ 원본과 이동 평균 · 이동 표준편차를 한 그래프에 그려 정상성을 눈으로 확인한다.
+
+    정상 시계열이라면 이동 평균과 이동 표준편차가 모두 수평선에 가까워야 한다.
+
+
+    Args:
+        data (DataFrame | Series): 날짜 인덱스를 가진 시계열 데이터.
+        window (init): 이동 계산에 사용할 창 크기. 계절 주기로 잡는다.
+        column (str): data가 데이터프레임인 경우 대상 컬럼명 (기본값: None)
+        title (str): 그래프 제목 (기본값: None)
+        xlabel (str): x축 레이블 (기본값: None)
+        ylabel (str): y축 레이블 (기본값: None)
+        width (int): 캔버스 가로 픽셀 (기본값: 1280)
+        height (int): 캔버스 세로 픽셀 (기본값: 480)
+        save_path (str): 이미지 저장 경로 (기본값: None)
+
+    
+    Returns:
+        DataFrame: 원본·이동 평균·이동 표준편차.
+    
+    """
+
+
+    # --- 1) 대상 데이터 준비 ---
+    if column is not None:                      # 컬럼명이 전달되었다면
+        data = data[column]                     # 대상 컬럼만 추출
+
+
+
+    # --- 2) 이동 평균과 이동 표준편차 계산 ---
+    result_df = DataFrame({
+        "원본": data,
+        "이동 평균": data.rolling(window).mean(),
+        "이동 표준편차": data.rolling(window).std(),
+    })
+
+
+
+    # --- 3) 그래프 그리기 및 결과 반환 ---
+    if title is None:
+        title = f"원본 · 이동 평균 · 이동 표준편차 (window={window})"
+
+    fig, ax = my_plot.init(width=width, height=height, title=title, 
+                           xlabel=xlabel, ylabel=ylabel)
+
+    for col in result_df.columns:
+        my_plot.lineplot(x=result_df.index, y=result_df[col], label=col, ax=ax)
+
+
+    ax.legend()
+    my_plot.show(save_path=save_path)
+
+
+    return result_df
+
+
+
+
+
+# ------------------
+# 평활 비교 함수 정의
+# ------------------
+def compare_smoothing(data, sizes, column=None, method="ma", overlay=False,
+                      plot=True, title=None, xlabel=None, ylabel=None,
+                      width=960, height=400, save_path=None):
+
+    """ 창 크기(또는 span)를 바꿔가며 평활 결과를 비교한다.
+
+
+    Args:
+        data (DataFrame | Series): 날짜 인덱스를 가진 시계열 데이터.
+        size (list | tuple): 비교할 창 크기(또는 span) 목록.
+        column (str): data가 데이터프레임인 경우 대상 컬럼명 (기본값: None)
+        method (str): "ma"(이동 평균) · "ewm"(지수 평활) · "both"(둘 다) (기본값: "ma")
+        overlay (bool): True면 한 축에 겹쳐 그리고, False면 격자에 나눠 그린다. (기본값: False)
+        plot (bool): 그래프를 그릴지 여부 (기본값: True)
+        title (str): 그래프 제목 (기본값: None)
+        xlabel (str): x축 레이블 (기본값: None)
+        ylabel (str): y축 레이블 (기본값: None)
+        width (int): 캔버스 가로 픽셀 (기본값: 960)
+        height (int): 캔버스 세로 픽셀 (기본값: 400)
+        save_path (str): 이미지 저장 경로 (기본값: None)
+    
+        
+        Returns:
+            DataFrame: 원본과 평활 결과.
+
+    """
+
+
+    # --- 1) 창 크기별 평활 계산 ---
+    if column is not None:                      # 컬럼명이 전달되었다면
+        data = data[column]                     # 대상 컬럼만 추출
+
+    result_df = DataFrame({"원본": data})        # 결과를 담을 데이터프레임 준비
+
+
+    for size in sizes:                          # 각 창 크기별로 평활 계산
+
+
+        # --- 1-1) 이동 평균 ---
+        if method == "ma" or method == "both":
+            result_df[f"이동 평균({size})"] = data.rolling(size).mean()
+
+
+        # --- 1-2) 지수 평활 ---
+        if method == "ewm" or method == "both":
+
+            # ewm()의 첫 인자는 span이 아니라 com이므로 span을 키워드로 명시한다.
+            result_df[f"지수 평활({size})"] = data.ewm(span=size).mean()
+
+
+    # 그래프를 그리지 않으면 결과표만 반환하면 여기서 중단
+    if not plot:
+        return result_df
+
+
+    
+    # --- 2) 한 축에 겹쳐 그리기 ---
+    if overlay:
+        fig, ax = my_plot.init(width=width, height=height, title=title,
+                               xlabel=xlabel, ylabel=ylabel)
+
+        for col in result_df.columns:
+            my_plot.lineplot(x=result_df.index, y=result_df[col], label=col, ax=ax)
+
+
+        ax.legend()
+        my_plot.show(save_path=save_path)
+
+
+        # 겹쳐 그린 경우에도 결과표를 반환하고 여기서 중단
+        return result_df
+
+
+
+    # --- 3) 격자에 한 칸씩 그리기 ---
+    cols = 2
+    rows = int(np.ceil(len(result_df.columns) / cols))
+
+    fig, ax = my_plot.init(rows=rows, cols=cols, width=width, height=height, title=title)
+
+
+    for i, col in enumerate(result_df.columns):
+        my_plot.lineplot(x=result_df.index, y=result_df[col], ax=ax[i])
+        ax[i].set_title(col)
+
+
+    # 컬럼 수가 홀수면, 마지막 칸이 남으므로 숨긴다
+    for i in range(len(result_df.columns), rows * cols):
+        ax[i].set_visible(False)
+
+    my_plot.show(save_path=save_path)
+
+
+    return result_df
+    
